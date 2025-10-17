@@ -45,13 +45,20 @@ export type TabSnapshot = {
   downloads: { download: playwright.Download, finished: boolean, outputFile: string }[];
 };
 
+export type NetworkRequestData = {
+  request: playwright.Request;
+  response?: playwright.Response;
+  status: 'pending' | 'finished' | 'failed';
+  error?: string;
+};
+
 export class Tab extends EventEmitter<TabEventsInterface> {
   readonly context: Context;
   readonly page: Page;
   private _lastTitle = 'about:blank';
   private _consoleMessages: ConsoleMessage[] = [];
   private _recentConsoleMessages: ConsoleMessage[] = [];
-  private _requests: Set<playwright.Request> = new Set();
+  private _requests: Map<string, NetworkRequestData> = new Map();
   private _onPageClose: (tab: Tab) => void;
   private _modalStates: ModalState[] = [];
   private _downloads: { download: playwright.Download, finished: boolean, outputFile: string }[] = [];
@@ -64,7 +71,10 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this._onPageClose = onPageClose;
     page.on('console', event => this._handleConsoleMessage(messageToConsoleMessage(event)));
     page.on('pageerror', error => this._handleConsoleMessage(pageErrorToConsoleMessage(error)));
-    page.on('request', request => this._requests.add(request));
+    page.on('request', request => this._handleRequest(request));
+    page.on('response', response => this._handleResponse(response));
+    page.on('requestfinished', request => this._handleRequestFinished(request));
+    page.on('requestfailed', request => this._handleRequestFailed(request));
     page.on('close', () => this._onClose());
     page.on('filechooser', chooser => {
       this.setModalState({
@@ -103,8 +113,14 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     for (const message of await Tab.collectConsoleMessages(this.page))
       this._handleConsoleMessage(message);
     const requests = await this.page.requests().catch(() => []);
-    for (const request of requests)
-      this._requests.add(request);
+    for (const request of requests) {
+      const response = await request.response().catch(() => null);
+      this._requests.set(request.url(), {
+        request,
+        response: response ?? undefined,
+        status: 'finished',
+      });
+    }
   }
 
   modalStates(): ModalState[] {
@@ -150,14 +166,77 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     this._requests.clear();
   }
 
+  private _shouldCaptureConsoleMessage(message: ConsoleMessage): boolean {
+    const text = message.text.toLowerCase();
+    const location = message.toString().toLowerCase();
+
+    // Filter out Next.js static chunks and webpack dev server logs
+    const nextJsPatterns = [
+      '_next/static/',
+      'webpack-hmr',
+      'hot-update',
+      '[hmr]',
+      '[fast refresh]',
+      'webpack://',
+      'static/chunks/',
+      'static/css/',
+      'static/media/',
+    ];
+
+    for (const pattern of nextJsPatterns) {
+      if (text.includes(pattern) || location.includes(pattern)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   private _handleConsoleMessage(message: ConsoleMessage) {
+    if (!this._shouldCaptureConsoleMessage(message)) {
+      return;
+    }
     this._consoleMessages.push(message);
     this._recentConsoleMessages.push(message);
+  }
+
+  private _handleRequest(request: playwright.Request) {
+    this._requests.set(request.url(), {
+      request,
+      status: 'pending',
+    });
+  }
+
+  private _handleResponse(response: playwright.Response) {
+    const data = this._requests.get(response.url());
+    if (data) {
+      data.response = response;
+    }
+  }
+
+  private _handleRequestFinished(request: playwright.Request) {
+    const data = this._requests.get(request.url());
+    if (data) {
+      data.status = 'finished';
+    }
+  }
+
+  private _handleRequestFailed(request: playwright.Request) {
+    const data = this._requests.get(request.url());
+    if (data) {
+      data.status = 'failed';
+      const failure = request.failure();
+      data.error = failure?.errorText;
+    }
   }
 
   private _onClose() {
     this._clearCollectedArtifacts();
     this._onPageClose(this);
+  }
+
+  resetLogs(): void {
+    this._clearCollectedArtifacts();
   }
 
   async updateTitle() {
@@ -179,8 +258,6 @@ export class Tab extends EventEmitter<TabEventsInterface> {
   }
 
   async navigate(url: string) {
-    this._clearCollectedArtifacts();
-
     const downloadEvent = callOnPageNoTrace(this.page, page => page.waitForEvent('download').catch(logUnhandledError));
     try {
       await this.page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -212,9 +289,9 @@ export class Tab extends EventEmitter<TabEventsInterface> {
     return this._consoleMessages.filter(message => type ? message.type === type : true);
   }
 
-  async requests(): Promise<Set<playwright.Request>> {
+  async requests(): Promise<NetworkRequestData[]> {
     await this._initializedPromise;
-    return this._requests;
+    return Array.from(this._requests.values());
   }
 
   async captureSnapshot(mode: 'full' | 'incremental'): Promise<TabSnapshot> {
@@ -327,7 +404,7 @@ function pageErrorToConsoleMessage(errorOrValue: Error | any): ConsoleMessage {
   };
 }
 
-export function renderModalStates(context: Context, modalStates: ModalState[]): string[] {
+export function renderModalStates(_context: Context, modalStates: ModalState[]): string[] {
   const result: string[] = ['### Modal state'];
   if (modalStates.length === 0)
     result.push('- There is no modal state present');

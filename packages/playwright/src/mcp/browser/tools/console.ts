@@ -34,6 +34,22 @@ const console = defineTabTool({
   },
 });
 
+const resetLogs = defineTabTool({
+  capability: 'core',
+  schema: {
+    name: 'browser_reset_logs',
+    title: 'Reset console and network logs',
+    description: 'Clears all accumulated console messages and network requests for task isolation',
+    inputSchema: z.object({}),
+    type: 'readOnly',
+  },
+  handle: async (tab, params, response) => {
+    tab.resetLogs();
+    response.addResult('Logs reset successfully');
+  },
+});
+
 export default [
   console,
+  resetLogs,
 ];
